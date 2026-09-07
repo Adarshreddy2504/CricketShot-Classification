@@ -1,0 +1,18 @@
+segmentation:
+  min_duration: 3.0
+  max_duration: 10.0
+  hsv_green_ratio_threshold: 0.3
+
+pipeline_a:
+  frames: 30
+  resolution: [224, 224]
+  num_classes: 10
+
+pipeline_b:
+  ocr_bbox:
+    bottom_percent: 20
+
+preprocessing:
+  num_frames: 30
+  target_size: [224, 224]
+  ocr_frame_index: 0
