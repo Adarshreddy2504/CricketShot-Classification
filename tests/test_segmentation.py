@@ -1,5 +1,5 @@
 import os
-from src.segmentation.auto_clipper import extract_cricket_deliveries
+from src.pipeline_a.auto_clipper import extract_cricket_deliveries
 
 def main():
     video_path = "data/raw_matches/long_match.mp4"

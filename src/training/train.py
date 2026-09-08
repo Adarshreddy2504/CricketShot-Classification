@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from src.models.efficientnet_gru import CricShotEfficientGRU
+from src.pipeline_a.efficientnet_gru import CricShotEfficientGRU
 
 def set_seed(seed=42):
     torch.manual_seed(seed)
@@ -39,7 +39,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    data_dir = 'data/tiny_training_tensors'
+    data_dir = 'data/cropped_training_tensors'
     dataset = CricketTensorDataset(data_dir=data_dir)
     
     if len(dataset) == 0:
@@ -84,6 +84,7 @@ if __name__ == '__main__':
         accuracy = 100 * correct / total
         print(f"Epoch [{epoch+1}/{epochs}] Average Loss: {avg_loss:.4f}, Training Accuracy: {accuracy:.2f}%")
         
-    os.makedirs('data', exist_ok=True)
-    torch.save(model.state_dict(), 'data/cricshot_sota.pth')
-    print("Training complete. Model saved to data/cricshot_sota.pth")
+    # Ensure the models directory exists and save the weights there
+    os.makedirs('models', exist_ok=True)
+    torch.save(model.state_dict(), 'models/cricshot_sota.pth')
+    print("Training complete. Model saved to models/cricshot_sota.pth")
