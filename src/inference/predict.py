@@ -1,79 +1,248 @@
-import torch
+import sys
+import pathlib
 import cv2
-import json
-import os
+import torch
 import numpy as np
-from src.models.efficientnet_gru import CricShotEfficientGRU
+from PIL import Image
+from torchvision import transforms
+from src.training.sota_ours import ImprovedSOTAModel
 
-# Setup Block
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-with open('data/class_mapping.json', 'r') as f:
-    idx_to_class = {v: k for k, v in json.load(f).items()}
+# ============================================================
+# SETTINGS
+# ============================================================
 
-model = CricShotEfficientGRU(num_classes=10).to(device)
-model.load_state_dict(torch.load('data/cricshot_sota.pth', map_location=device, weights_only=True))
-model.eval()
+CHECKPOINT = pathlib.Path(
+    r"models\improved-sota-epoch=12-val_acc=0.7840.ckpt"
+)
 
-def preprocess_video(video_path):
-    cap = cv2.VideoCapture(video_path)
+CLASS_NAMES = [
+    "cover",
+    "defense",
+    "flick",
+    "hook",
+    "late_cut",
+    "lofted",
+    "pull",
+    "square_cut",
+    "straight",
+    "sweep"
+]
+
+N_FRAMES = 30
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ============================================================
+# FRAME EXTRACTION
+# ============================================================
+
+def extract_frames(video_path, n_frames=30):
+    cap = cv2.VideoCapture(str(video_path))
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # Generate 30 evenly spaced indices
-    indices = np.linspace(0, total_frames - 1, 30, dtype=int)
-    
-    frames = []
-    for idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
-            # Fallback for failed frame reads (rare but possible at the end of some videos)
-            frame = np.zeros((224, 224, 3), dtype=np.uint8)
-        else:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Aspect-ratio-preserving resize
-            h, w = frame.shape[:2]
-            scale = min(224 / w, 224 / h)
-            nw, nh = int(w * scale), int(h * scale)
-            resized_frame = cv2.resize(frame, (nw, nh))
-            
-            # Black canvas padding
-            padded_frame = np.zeros((224, 224, 3), dtype=np.uint8)
-            x_offset = (224 - nw) // 2
-            y_offset = (224 - nh) // 2
-            padded_frame[y_offset:y_offset+nh, x_offset:x_offset+nw] = resized_frame
-            frame = padded_frame
-        frames.append(frame)
-    cap.release()
-    
-    # Stack, transpose to (30, 3, 224, 224), normalize / 255.0, cast to np.float32
-    frames = np.array(frames)
-    frames = frames.transpose((0, 3, 1, 2))
-    frames = (frames / 255.0).astype(np.float32)
-    
-    # ImageNet Normalization
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
-    frames = (frames - mean) / std
-    
-    # Convert to tensor, add batch dimension, move to device
-    return torch.tensor(frames).unsqueeze(0).to(device)
 
-if __name__ == '__main__':
-    test_video = "data/delivery_clips/long_match-Scene-002.mp4"
-    if not os.path.exists(test_video):
-        print("Video not found")
-        exit()
-        
-    tensor = preprocess_video(test_video)
-    
+    if total_frames <= 0:
+        raise RuntimeError("Could not determine number of frames.")
+
+    indices = np.linspace(
+        0,
+        total_frames - 1,
+        n_frames
+    ).astype(int)
+
+    frames = []
+
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, frame = cap.read()
+
+        if ret:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame)
+
+    cap.release()
+
+    # If fewer than 30 frames were successfully read,
+    # repeat the last frame.
+    if len(frames) == 0:
+        raise RuntimeError("Could not read any frames.")
+
+    while len(frames) < n_frames:
+        frames.append(frames[-1].copy())
+
+    return frames[:n_frames]
+
+
+# ============================================================
+# PREPROCESSING
+# ============================================================
+
+transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+
+# ============================================================
+# LOAD MODEL
+# ============================================================
+
+def load_model():
+    print("Loading model...")
+
+    model = ImprovedSOTAModel(
+        num_classes=10,
+        backbone="efficientnet"
+    )
+
+    checkpoint = torch.load(
+        CHECKPOINT,
+        map_location=DEVICE,
+        weights_only=False
+    )
+
+    # Lightning checkpoint
+    state_dict = checkpoint["state_dict"]
+
+    # Remove possible "model." prefix if present
+    cleaned_state_dict = {}
+
+    for key, value in state_dict.items():
+        if key.startswith("model."):
+            key = key[len("model."):]
+        cleaned_state_dict[key] = value
+
+    model.load_state_dict(
+        cleaned_state_dict,
+        strict=False
+    )
+
+    model.to(DEVICE)
+    model.eval()
+
+    print(f"Model loaded on: {DEVICE}")
+
+    return model
+
+
+# ============================================================
+# PREDICTION
+# ============================================================
+
+def predict(video_path):
+
+    video_path = pathlib.Path(video_path)
+
+    if not video_path.exists():
+        print(f"ERROR: Video not found:")
+        print(video_path)
+        return
+
+    print()
+    print("=" * 60)
+    print("CRICKET SHOT PREDICTION")
+    print("=" * 60)
+
+    print(f"Video: {video_path.name}")
+
+    frames = extract_frames(
+        video_path,
+        N_FRAMES
+    )
+
+    # Convert frames to tensors
+    tensors = []
+
+    for frame in frames:
+        tensors.append(transform(frame))
+
+    # Shape:
+    # (30, 3, 224, 224)
+    x = torch.stack(tensors)
+
+    # Add batch dimension:
+    # (1, 30, 3, 224, 224)
+    x = x.unsqueeze(0)
+
+    x = x.to(DEVICE)
+
+    model = load_model()
+
     with torch.no_grad():
-        outputs = model(tensor)
-        
-    probs = torch.nn.functional.softmax(outputs, dim=1)
-    pred_idx = torch.argmax(probs).item()
-    confidence = probs[0][pred_idx].item() * 100
-    
-    print(f"Predicted shot: {idx_to_class[pred_idx]}")
-    print(f"Confidence: {confidence:.2f}%")
+        logits = model(x)
+
+        probabilities = torch.softmax(
+            logits,
+            dim=1
+        )[0]
+
+    predicted_index = torch.argmax(
+        probabilities
+    ).item()
+
+    predicted_class = CLASS_NAMES[
+        predicted_index
+    ]
+
+    confidence = probabilities[
+        predicted_index
+    ].item() * 100
+
+    print()
+    print("PREDICTION")
+    print("-" * 60)
+
+    print(f"Shot       : {predicted_class.upper()}")
+    print(f"Confidence : {confidence:.2f}%")
+
+    print()
+    print("ALL CLASS PROBABILITIES")
+    print("-" * 60)
+
+    results = []
+
+    for i, class_name in enumerate(CLASS_NAMES):
+        prob = probabilities[i].item() * 100
+        results.append(
+            (class_name, prob)
+        )
+
+    results.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    for class_name, prob in results:
+        print(
+            f"{class_name:<15} {prob:6.2f}%"
+        )
+
+    print("=" * 60)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    if len(sys.argv) < 2:
+        print()
+        print("Usage:")
+        print(
+            r'python predict.py "path\to\video.avi"'
+        )
+        print()
+        sys.exit(1)
+
+    predict(sys.argv[1])
