@@ -1,38 +1,42 @@
-import os
-from src.segmentation.auto_clipper import extract_cricket_deliveries
+import sys
+import pathlib
+
+# Add the parent directory (Cricket root) to the system path
+sys.path.append(str(pathlib.Path(__file__).parent.parent))
+
+from src.segmentation.auto_clipper import AutoClipper
 
 def main():
-    video_path = "data/raw_matches/long_match.mp4"
-    output_dir = "data/delivery_clips/"
-    
-    print("=========================================")
-    print(f"Starting segmentation test on video: {video_path}")
-    print("=========================================")
-    
-    if not os.path.exists(video_path):
-        print(f"Error: Video file not found at {video_path}")
-        print("Please ensure the video file exists before running.")
+    # 1. Automatically find a test video in your raw_matches folder
+    raw_matches_dir = pathlib.Path("data/raw_matches")
+    video_files = list(raw_matches_dir.glob("*.mp4")) + list(raw_matches_dir.glob("*.avi"))
+
+    if not video_files:
+        print("[-] No videos found in data/raw_matches/. Please drop a video in there first!")
         return
-        
-    print(f"Ensuring output directory exists: {output_dir}")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    print("\nBeginning extraction process...")
-    total_scenes, valid_clips = extract_cricket_deliveries(video_path, output_dir)
-    print("\nSegmentation test completed successfully!")
-    
-    if total_scenes > 0:
-        rejection_rate = ((total_scenes - valid_clips) / total_scenes) * 100
-    else:
-        rejection_rate = 0.0
-        
-    print("=========================================")
-    print("      EXTRACTION METRICS SUMMARY         ")
-    print("=========================================")
-    print(f"Total Camera Cuts Detected : {total_scenes}")
-    print(f"Valid Deliveries Extracted : {valid_clips}")
-    print(f"Noise Rejection Rate       : {rejection_rate:.2f}%")
-    print("=========================================")
+
+    test_video = str(video_files[0])
+    print(f"[+] Testing Clipper on: {test_video}")
+
+    # 2. Initialize your new Dual-Model AutoClipper
+    try:
+        clipper = AutoClipper(
+            ball_model_path="models/Ball_Detection_Model.pt", 
+            bat_model_path="models/Bat_Detection_Model.pt",
+            output_dir="data/delivery_clips"
+        )
+    except Exception as e:
+        print(f"[-] Failed to initialize clipper: {e}")
+        return
+
+    # 3. Process the match and slice the 1-second clips
+    print("[+] Starting the video segmentation process...")
+    generated_clips = clipper.process_match(test_video, clip_duration_sec=1.0)
+
+    # 4. Output the results
+    print(f"\n[+] Clipper finished successfully! Generated {len(generated_clips)} clips:")
+    for clip in generated_clips:
+        print(f"  -> {clip}")
 
 if __name__ == "__main__":
     main()
