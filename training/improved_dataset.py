@@ -28,6 +28,8 @@ import numpy as np
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 from typing import List, Tuple, Optional
+import random
+import torchvision.transforms.functional as TF
 
 
 def extract_frames_uniform(video_path: str, n_frames: int = 30) -> List[np.ndarray]:
@@ -95,45 +97,55 @@ class ResizeWithPadding:
         return transforms.functional.pad(img, [left, top, right, bottom], fill=self.fill)
 
 
-def get_standard_transforms(training: bool = False, image_size: int = 224) -> transforms.Compose:
-    """
-    Get standard ImageNet normalization transforms.
+class ConsistentVideoTransform:
+    """Applies identically parameterized augmentations to a sequence of 30 frames."""
+    
+    def __init__(self, training: bool = False, image_size: int = 224):
+        self.training = training
+        self.image_size = image_size
+        self.resize = ResizeWithPadding(image_size)
+        
+        # Standard ImageNet normalization values
+        self.mean = [0.485, 0.456, 0.406]
+        self.std = [0.229, 0.224, 0.225]
 
-    Applies:
-    - Resize to specified image_size
-    - Optional augmentations (if training=True):
-        * Random horizontal flip (p=0.5)
-        * Random rotation (±10 degrees)
-        * Color jitter (brightness, contrast, saturation, hue)
-    - Convert to tensor
-    - Normalize with ImageNet mean and std
+    def __call__(self, frames: List[np.ndarray]) -> torch.Tensor:
+        # 1. Base conversion & resize (Deterministic)
+        pil_frames = [TF.to_pil_image(frame) for frame in frames]
+        pil_frames = [self.resize(frame) for frame in pil_frames]
 
-    Args:
-        training: Whether to include training augmentations
-        image_size: Target image size (default: 224)
+        # 2. Sequence-Level Augmentation (Apply SAME params to ALL frames)
+        if self.training:
+            # -- Decide random parameters ONCE per video clip --
+            apply_flip = random.random() < 0.5
+            angle = transforms.RandomRotation.get_params([-10.0, 10.0])
+            
+            # ColorJitter params (base 1.0, range +/- 0.2, hue +/- 0.1)
+            brightness = random.uniform(0.8, 1.2)
+            contrast = random.uniform(0.8, 1.2)
+            saturation = random.uniform(0.8, 1.2)
+            hue = random.uniform(-0.1, 0.1)
 
-    Returns:
-        Composed transforms pipeline
-    """
-    transform_list = [
-        transforms.ToPILImage(),
-        ResizeWithPadding(image_size),
-    ]
+            # -- Apply identically to the entire sequence --
+            transformed = []
+            for img in pil_frames:
+                if apply_flip:
+                    img = TF.hflip(img)
+                img = TF.rotate(img, angle)
+                img = TF.adjust_brightness(img, brightness)
+                img = TF.adjust_contrast(img, contrast)
+                img = TF.adjust_saturation(img, saturation)
+                img = TF.adjust_hue(img, hue)
+                transformed.append(img)
+                
+            pil_frames = transformed
 
-    if training:
-        transform_list.extend([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(10),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-        ])
+        # 3. Final conversion & normalization
+        tensor_frames = [TF.to_tensor(frame) for frame in pil_frames]
+        tensor_frames = [TF.normalize(t, self.mean, self.std) for t in tensor_frames]
 
-    transform_list.extend([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    return transforms.Compose(transform_list)
-
+        # Stack into (30, 3, 224, 224)
+        return torch.stack(tensor_frames)
 
 class ImprovedCricketDataset(Dataset):
     """
@@ -195,7 +207,7 @@ class ImprovedCricketDataset(Dataset):
             self.training = training
 
         self.class_to_idx = {name: idx for idx, name in enumerate(class_names)}
-        self.transforms = get_standard_transforms(self.training, self.image_size)
+        self.sequence_transform = ConsistentVideoTransform(self.training, self.image_size)
 
     def extract_frames(self, video_path: str) -> List[np.ndarray]:
         """
@@ -211,16 +223,9 @@ class ImprovedCricketDataset(Dataset):
 
     def transform_frames(self, frames: List[np.ndarray]) -> torch.Tensor:
         """
-        Transform frames to tensor with normalization.
-
-        Args:
-            frames: List of RGB frames as numpy arrays
-
-        Returns:
-            Tensor of shape (n_frames, 3, image_size, image_size)
+        Transform frames to tensor with temporally consistent normalization.
         """
-        frame_tensors = [self.transforms(frame) for frame in frames]
-        return torch.stack(frame_tensors)
+        return self.sequence_transform(frames)
 
     def __len__(self) -> int:
         """Return the total number of videos in the dataset."""
