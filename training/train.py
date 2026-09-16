@@ -1,7 +1,7 @@
 import os
 import pathlib
 import json
-import os
+
 
 # Disable PyTorch internal FLOP-counter warning
 os.environ["TORCH_LOGS"] = "-torch.utils.flop_counter"
@@ -445,7 +445,7 @@ class ImprovedSOTAModel(pl.LightningModule):
         }
 
     # ========================================================
-    # OPTIMIZER + E0 SCHEDULER
+    # OPTIMIZER + E1 SCHEDULER
     # ========================================================
 
     def configure_optimizers(self):
@@ -457,24 +457,19 @@ class ImprovedSOTAModel(pl.LightningModule):
             betas=(0.9, 0.999)
         )
 
-        # ====================================================
-        # E2: KEEP THE SAME SCHEDULER AS THE EXISTING BASELINE CODE
-        # ====================================================
-
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer,
-            T_max=30,
-            eta_min=1e-6
+            step_size=10,
+            gamma=0.1
         )
 
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch"
-            }
+        "lr_scheduler": {
+            "scheduler": scheduler,
+            "interval": "epoch"
         }
-
+    }
     # ========================================================
     # CLASS WEIGHTS
     # ========================================================
@@ -910,7 +905,7 @@ def print_evaluation_results(
 def save_results(
     results,
     output_dir,
-    filename="model1_e0_results.json"
+    filename="model1_e1_consistent_aug_results.json"
 ):
 
     output_dir = pathlib.Path(
@@ -1173,20 +1168,12 @@ def main():
     )
 
     # --------------------------------------------------------
-    # E0 OUTPUT DIRECTORIES
+    # E1 OUTPUT DIRECTORIES
     # --------------------------------------------------------
 
-    model_dir = pathlib.Path(
-        "models_e2"
-    )
-
-    log_dir = pathlib.Path(
-        "lightning_logs_e2"
-    )
-
-    result_dir = pathlib.Path(
-        "results_e2"
-    )
+    model_dir = pathlib.Path("models_e1_consistent_aug")
+    log_dir = pathlib.Path("lightning_logs_e1_consistent_aug")
+    result_dir = pathlib.Path("results_e1_consistent_aug")
 
     model_dir.mkdir(
         exist_ok=True
@@ -1204,7 +1191,7 @@ def main():
         monitor="val_acc",
         dirpath=str(model_dir),
         filename=(
-            "model1-e2-{epoch:02d}-"
+            "model1-e1-consistent-aug-{epoch:02d}-"
             "{val_acc:.4f}"
         ),
         save_top_k=3,
@@ -1250,7 +1237,7 @@ def main():
 
         logger=TensorBoardLogger(
             str(log_dir),
-            name="model1_e2_padding"
+            name="model1_e1_consistent_aug"
         ),
 
         accelerator="auto",
@@ -1272,8 +1259,8 @@ def main():
 
     print("\n" + "=" * 60)
 
-    print("MODEL 1 - E2 ASPECT-RATIO PADDING")
-    print("CosineAnnealingLR (same as baseline code)")
+    print("MODEL 1 - E1 CONSISTENT AUGMENTATION")
+    print("StepLR (step_size=10, gamma=0.1)")
 
     print("Automatic resume: ENABLED")
 
@@ -1308,7 +1295,7 @@ def main():
     # --------------------------------------------------------
 
     print(
-        "\nEvaluating best E2 checkpoint..."
+        "\nEvaluating best E1 checkpoint..."
     )
 
     trainer.test(
@@ -1326,7 +1313,7 @@ def main():
     )
 
     print(
-        f"\nBest E2 checkpoint:\n"
+        f"\nBest E1 checkpoint:\n"
         f"{best_path}"
     )
 
@@ -1375,7 +1362,7 @@ def main():
 
     print_evaluation_results(
         results,
-        "MODEL 1 - E2 ASPECT-RATIO PADDING"
+        "MODEL 1 - E1 CONSISTENT AUGMENTATION"
     )
 
     # --------------------------------------------------------
@@ -1385,11 +1372,11 @@ def main():
     save_results(
         results,
         output_dir=str(result_dir),
-        filename="model1_e2_results.json"
+        filename="model1_e1_consistent_aug_results.json"
     )
 
     print("\n" + "=" * 60)
-    print("E2 COMPLETE")
+    print("E1 CONSISTENT AUGMENTATION COMPLETE")
     print("=" * 60)
 
 
