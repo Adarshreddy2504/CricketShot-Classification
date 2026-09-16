@@ -1,0 +1,6 @@
+backbone: efficientnet
+learning_rate: 0.001
+n_frames: 30
+num_classes: 10
+temporal_dim: 256
+weight_decay: 0.0001
