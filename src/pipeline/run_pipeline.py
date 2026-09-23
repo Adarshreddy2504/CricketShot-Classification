@@ -68,9 +68,12 @@ def main():
     frames_base_dir = project_root / "data" / "frames"
     output_csv = project_root / "data" / "shot_predictions.csv"
     
-    checkpoint_path = project_root / "models" / "Sota_predict_model.ckpt"
+    checkpoint_path = project_root / "models" / "cricket_model.ckpt"
+
     if not checkpoint_path.exists():
-        checkpoint_path = project_root / "models" / "improved-sota-epoch=12-val_acc=0.7840.ckpt"
+        raise FileNotFoundError(
+            f"[ERROR] Cricket model checkpoint not found: {checkpoint_path}"
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n[*] Executing pipeline on device: {device}")
