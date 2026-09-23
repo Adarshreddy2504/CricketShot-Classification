@@ -1,9 +1,0 @@
-torch
-torchvision
-opencv-python
-scenedetect[opencv]
-numpy
-pytesseract
-Pillow
-PyYAML
-ultralytics

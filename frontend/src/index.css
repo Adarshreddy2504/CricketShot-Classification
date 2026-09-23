@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+@theme {
+  --color-electric-blue: #00f0ff;
+  --color-emerald-neon: #00ff66;
+  --color-dark-bg: #030712;
+  --color-card-bg: rgba(255, 255, 255, 0.02);
+  --color-card-border: rgba(255, 255, 255, 0.1);
+  --font-sans: "Inter", "Roboto", sans-serif;
+  --animate-gradient: gradient 8s ease infinite;
+}
+
+@keyframes gradient {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  10%, 30%, 50%, 70%, 90% { transform: translateX(-4px); }
+  20%, 40%, 60%, 80% { transform: translateX(4px); }
+}
+
+@keyframes ripple {
+  0% { transform: scale(0.8); opacity: 1; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-[var(--color-dark-bg)] text-white font-sans antialiased;
+    overflow-x: hidden;
+  }
+  
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-bold text-white tracking-tight;
+  }
+  
+  p {
+    @apply text-gray-400 leading-relaxed;
+  }
+}
+
+@layer utilities {
+  .glass {
+    @apply bg-[var(--color-card-bg)] backdrop-blur-xl border border-[var(--color-card-border)] border-t-white/20 shadow-2xl;
+    background: radial-gradient(circle at top left, rgba(255,255,255,0.05), transparent 70%), rgba(255, 255, 255, 0.02);
+  }
+  
+  .glass-hover {
+    @apply transition-all duration-500 hover:bg-white/5 hover:border-t-white/30 hover:shadow-electric-blue/20 hover:-translate-y-1;
+  }
+  
+  .neon-text-blue {
+    text-shadow: 0 0 10px rgba(0, 240, 255, 0.6), 0 0 20px rgba(0, 240, 255, 0.4), 0 0 40px rgba(0, 240, 255, 0.2);
+  }
+  
+  .neon-text-green {
+    text-shadow: 0 0 10px rgba(0, 255, 102, 0.6), 0 0 20px rgba(0, 255, 102, 0.4), 0 0 40px rgba(0, 255, 102, 0.2);
+  }
+  
+  .neon-box-blue {
+    box-shadow: 0 0 15px rgba(0, 240, 255, 0.5), inset 0 0 10px rgba(0, 240, 255, 0.3);
+  }
+  
+  .neon-box-green {
+    box-shadow: 0 0 15px rgba(0, 255, 102, 0.5), inset 0 0 10px rgba(0, 255, 102, 0.3);
+  }
+}

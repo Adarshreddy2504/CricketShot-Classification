@@ -1,6 +1,145 @@
-﻿data/
-*.pth
+﻿# ============================================================
+# PYTHON
+# ============================================================
+
 __pycache__/
-*.npy
-*.mp4
+*.py[cod]
+*.so
+
+.venv/
+venv/
+env/
+ENV/
+
+build/
+dist/
+*.egg-info/
+
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+
+# ============================================================
+# NODE
+# ============================================================
+
+node_modules/
+
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+
+# ============================================================
+# ENV / SECRETS
+# ============================================================
+
+.env
+.env.local
+.env.*.local
+!.env.example
+
+*.pem
+*.key
+
+
+# ============================================================
+# DATA / VIDEOS / FRAMES
+# ============================================================
+
+data/
+datasets/
+dataset/
+crickshot10/
+
 *.avi
+*.mov
+*.mkv
+*.webm
+
+backend/uploads/
+backend/outputs/
+backend/tmp/
+backend/temp/
+
+
+# ============================================================
+# TRAINING OUTPUTS
+# ============================================================
+
+*.pth
+*.pth.tar
+
+lightning_logs/
+tensorboard/
+runs/
+wandb/
+
+results/
+outputs/
+logs/
+
+models_*/
+*_checkpoints/
+*_logs/
+
+
+# ============================================================
+# NOTEBOOKS
+# ============================================================
+
+.ipynb_checkpoints/
+
+
+# ============================================================
+# IDE / OS
+# ============================================================
+
+.vscode/
+.idea/
+*.code-workspace
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# ============================================================
+# LOCAL TEMP FILES
+# ============================================================
+
+*.tmp
+*.bak
+*.swp
+*.swo
+
+
+# ============================================================
+# DEPLOYMENT MODELS — KEEP THESE IN GIT
+# ============================================================
+
+# Ignore model files generally
+*.pt
+*.ckpt
+
+# But keep the three production models
+!backend/models/
+!backend/models/Ball_Detection_Model.pt
+!backend/models/Bat_Detection_Model.pt
+!backend/models/cricket_model.ckpt
+
+
+# ============================================================
+# FRONTEND ASSETS — KEEP THESE IN GIT
+# ============================================================
+
+!frontend/public/
+!frontend/public/*.mp4
+!frontend/public/*.svg
