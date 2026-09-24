@@ -1,5 +1,8 @@
 import cv2
 import pathlib
+import os
+import shutil
+import logging
 import logging
 import easyocr
 from ultralytics import YOLO
@@ -42,7 +45,7 @@ class AutoClipper:
         # 2. Load EasyOCR (Optional Scoreboard Validation)
         if self.use_ocr:
             print("[*] Loading EasyOCR Scoreboard Validator...", flush=True)
-            self.ocr = easyocr.Reader(["en"], gpu=self.ocr_gpu)
+            self.ocr = easyocr.Reader(["en"], gpu=False)
             print("[+] All models successfully loaded.", flush=True)
         else:
             print("[+] YOLO models loaded. (OCR Disabled).", flush=True)
@@ -79,7 +82,7 @@ class AutoClipper:
     # =====================================================
     # PROCESS FULL MATCH
     # =====================================================
-    def process_match(self, video_path, clip_duration_sec=1.0):
+    def process_match(self, video_path, clip_duration_sec=1.0, active_tasks=None, task_id=None, temp_dir=None):
         video_path = pathlib.Path(video_path)
 
         if not video_path.exists():
@@ -106,6 +109,14 @@ class AutoClipper:
                   bar_format="{l_bar}{bar:40}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
 
             while cap.isOpened():
+                if active_tasks is not None and task_id is not None:
+                    if active_tasks.get(task_id, {}).get("cancelled"):
+                        print(f"🛑 NUKING TASK {task_id} MID-LOOP. Releasing resources...")
+                        cap.release()
+                        if temp_dir and os.path.exists(temp_dir):
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+                        return []
+
                 ret, frame = cap.read()
                 if not ret: break
 
@@ -149,6 +160,13 @@ class AutoClipper:
 
                 frame_idx += 1
                 pbar.update(1)
+
+                if active_tasks is not None and task_id is not None and total_frames > 0:
+                    if frame_idx % 50 == 0:
+                        current_percent = 10 + int((frame_idx / total_frames) * 30)
+                        if current_percent > active_tasks[task_id].get("progress", 0):
+                            active_tasks[task_id]["progress"] = current_percent
+                            active_tasks[task_id]["status"] = "Extracting Delivery Clips..."
 
         cap.release()
         print(f"\n[+] Completed. Extracted {len(generated_clips)} clips.", flush=True)

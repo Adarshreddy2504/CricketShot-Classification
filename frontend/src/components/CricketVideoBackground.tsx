@@ -13,7 +13,6 @@ export function CricketVideoBackground() {
       {/* Background Video with Scroll-Linked Parallax */}
       <motion.video 
         autoPlay 
-        loop 
         muted 
         playsInline 
         className="absolute top-0 left-0 w-full h-full object-cover"
@@ -22,18 +21,6 @@ export function CricketVideoBackground() {
       />
 
       <div className="absolute inset-0 bg-black/60 z-[-45]" />
-      <div className="absolute inset-0 z-[-44] opacity-30 bg-[linear-gradient(to_right,#ffffff1a_1px,transparent_1px),linear-gradient(to_bottom,#ffffff1a_1px,transparent_1px)] bg-[size:30px_30px] pointer-events-none" />
-
-      {/* 2. Computer Vision Scanning Laser */}
-      <motion.div 
-        className="absolute top-0 left-0 h-[1px] w-full bg-cyan-400/50 shadow-[0_0_15px_#00f0ff]"
-        animate={{ y: ["0vh", "100vh"] }}
-        transition={{ 
-          duration: 3.5, 
-          repeat: Infinity, 
-          ease: "linear" 
-        }}
-      />
     </div>
   );
 }

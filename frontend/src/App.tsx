@@ -5,14 +5,13 @@ import { Hero } from "./components/Hero";
 import { UploadZone } from "./components/UploadZone";
 import { AnalysisDashboard } from "./components/AnalysisDashboard";
 import { ArchitectureExplainer } from "./components/ArchitectureExplainer";
-import { ShotDictionary } from "./components/ShotDictionary";
+import { ShotClasses } from "./components/ShotClasses";
 import { ModelMetrics } from "./components/ModelMetrics";
-import { SystemArchitectureBoard } from "./components/SystemArchitectureBoard";
+
 import { CricketVideoBackground } from "./components/CricketVideoBackground";
-import { api, type InferenceResult } from "./services/api";
+import { type InferenceResult } from "./services/api";
 
 function App() {
-  const [isProcessing, setIsProcessing] = useState(false);
   const [result, setResult] = useState<InferenceResult | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
 
@@ -37,24 +36,13 @@ function App() {
       lenis.destroy();
     };
   }, []);
-  const handleUpload = async (file: File) => {
-    setIsProcessing(true);
-    setResult(null);
-
-    try {
-      const url = URL.createObjectURL(file);
-      setVideoUrl(url);
-
-      const inferenceData = await api.predictShot(file);
-      setResult(inferenceData);
-    } catch (error) {
-      console.error("Error processing video", error);
-    } finally {
-      setIsProcessing(false);
-      setTimeout(() => {
-        document.getElementById('system-architecture')?.scrollIntoView({ behavior: "smooth" });
-      }, 100);
-    }
+  const handleUploadComplete = (file: File, inferenceData: InferenceResult) => {
+    const url = URL.createObjectURL(file);
+    setVideoUrl(url);
+    setResult(inferenceData);
+    setTimeout(() => {
+      document.getElementById('demo-zone')?.scrollIntoView({ behavior: "smooth" });
+    }, 100);
   };
 
   return (
@@ -87,7 +75,6 @@ function App() {
 
         {/* Center: Navigation Links */}
         <div className="hidden md:flex items-center gap-6 z-0">
-          <a href="#architecture" className="text-sm font-semibold text-gray-300 transition-colors duration-300 hover:text-cyan-400 hover:drop-shadow-[0_0_8px_rgba(0,255,255,0.8)]">Architecture</a>
           <a href="#models" className="text-sm font-semibold text-gray-300 transition-colors duration-300 hover:text-cyan-400 hover:drop-shadow-[0_0_8px_rgba(0,255,255,0.8)]">Models</a>
           <a href="https://github.com/your-username/cricshot" target="_blank" rel="noopener noreferrer" className="text-sm font-semibold text-gray-300 transition-colors duration-300 hover:text-cyan-400 hover:drop-shadow-[0_0_8px_rgba(0,255,255,0.8)]">GitHub</a>
         </div>
@@ -109,8 +96,7 @@ function App() {
         <div className="flex flex-col gap-24">
           <div id="demo-zone">
             <UploadZone 
-              onUpload={handleUpload} 
-              isLoading={isProcessing} 
+              onUploadComplete={handleUploadComplete} 
             />
             
             {videoUrl && (
@@ -119,12 +105,11 @@ function App() {
           </div>
 
           <div>
-            <ShotDictionary />
+            <ShotClasses />
           </div>
 
           <div id="architecture">
             <ArchitectureExplainer />
-            <SystemArchitectureBoard result={result} />
           </div>
 
           <ModelMetrics />
