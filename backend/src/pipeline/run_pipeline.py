@@ -10,7 +10,7 @@ from PIL import Image
 # Import your custom modules
 from src.segmentation.auto_clipper import AutoClipper
 from src.pipeline.extract_frames import extract_frames
-from src.pipeline.efficientnet_gru import EfficientNetGRU # Update if your model file/class is named differently
+from backend.src.pipeline.efficientnet_transformer import EfficientNetGRU # Update if your model file/class is named differently
 
 # The 10 target classes
 SHOT_CLASSES = [

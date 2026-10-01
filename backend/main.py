@@ -1,36 +1,79 @@
+from __future__ import annotations
+
 import asyncio
 import json
+import os
 import shutil
+import statistics
 import tempfile
+import threading
+import time
 import uuid
+from collections import deque
+from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
 from PIL import Image
 from torchvision import transforms
 
-from src.pipeline.efficientnet_gru import EfficientNetGRU
-from src.pipeline.extract_frames import extract_frames
-from src.segmentation.auto_clipper import AutoClipper
+
+# ============================================================================
+# LOCAL IMPORTS
+# ============================================================================
+
+from src.pipeline.efficientnet_transformer import (
+    ImprovedSOTAModel,
+)
+
+from src.tracking import (
+    BallDetector,
+    BallTracker,
+    MAX_EARLY_POSITIONS,
+    build_homography,
+    classify_length,
+    classify_line,
+    compute_bounce_angle,
+    compute_release_angle,
+    compute_release_speed,
+    detect_bounce,
+    draw_trajectory_trail,
+    estimate_swing,
+    get_fps,
+)
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+# ============================================================================
+# PATHS
+# ============================================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "models"
 
-BALL_MODEL = MODELS_DIR / "Ball_Detection_Model.pt"
-BAT_MODEL = MODELS_DIR / "Bat_Detection_Model.pt"
-CRICKET_MODEL = MODELS_DIR / "cricket_model.ckpt"
+MODELS_DIR = BASE_DIR / "models"
+OUTPUT_DIR = BASE_DIR / "outputs"
+TMP_ROOT = BASE_DIR / "tmp"
+
+BALL_MODEL = MODELS_DIR / "best.pt"
+
+SHOT_MODEL = (
+    MODELS_DIR
+    / "cricket_model_transformer.ckpt"
+)
+
+
+# ============================================================================
+# SHOT MODEL
+# ============================================================================
 
 SHOT_CLASSES = [
     "Cover",
@@ -48,45 +91,396 @@ SHOT_CLASSES = [
 N_FRAMES = 30
 IMAGE_SIZE = 224
 
+
+# ============================================================================
+# DELIVERY SETTINGS
+# ============================================================================
+
+MIN_DELIVERY_FRAMES = 8
+
+MIN_FRAMES_BETWEEN_DELIVERIES = 60
+
+PRE_ROLL_FRAMES = 10
+POST_ROLL_FRAMES = 10
+
+MIN_CLIP_FRAMES = 30
+MAX_CLIP_FRAMES = 90
+
+
+# ============================================================================
+# RESOURCE SETTINGS
+# ============================================================================
+
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+
+TASK_TTL_SECONDS = 30 * 60
+
+CLEANUP_INTERVAL_SECONDS = 60
+
+MAX_TRAJECTORY_POINTS = 20000
+
+
+# ============================================================================
+# DEVICE
+# ============================================================================
+
 DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
 )
 
+if DEVICE.type == "cuda":
+    torch.backends.cudnn.benchmark = True
 
-# ============================================================
-# FASTAPI
-# ============================================================
+
+# ============================================================================
+# APP
+# ============================================================================
 
 app = FastAPI(
-    title="CricShot API",
-    version="2.0.0",
+    title="CricShot + CricketTracker API",
+    version="4.0.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
-# ============================================================
-# EXACT VALIDATION/TEST PREPROCESSING
-# ============================================================
+TMP_ROOT.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+app.mount(
+    "/outputs",
+    StaticFiles(
+        directory=str(OUTPUT_DIR)
+    ),
+    name="outputs",
+)
+
+
+# ============================================================================
+# GLOBAL STATE
+# ============================================================================
+
+_tasks: dict[str, dict[str, Any]] = {}
+
+_tasks_lock = threading.RLock()
+
+PROCESS_LOCK = threading.Lock()
+
+_shot_model: ImprovedSOTAModel | None = None
+_shot_model_lock = threading.Lock()
+
+_ball_detector: BallDetector | None = None
+_ball_detector_lock = threading.Lock()
+
+_cleanup_started = False
+
+
+# ============================================================================
+# TIME
+# ============================================================================
+
+def now() -> float:
+    return time.time()
+
+
+# ============================================================================
+# TASK MANAGEMENT
+# ============================================================================
+
+def create_task() -> str:
+
+    task_id = str(
+        uuid.uuid4()
+    )
+
+    with _tasks_lock:
+
+        _tasks[task_id] = {
+            "progress": 0,
+            "status": "Queued",
+            "cancelled": False,
+            "created_at": now(),
+            "updated_at": now(),
+            "cancel_event": threading.Event(),
+            "result": None,
+            "error": None,
+            "output_path": None,
+        }
+
+    return task_id
+
+
+def update_task(
+    task_id: str,
+    progress: int,
+    status: str,
+    *,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+):
+
+    with _tasks_lock:
+
+        state = _tasks.get(task_id)
+
+        if state is None:
+            return
+
+        state["progress"] = max(
+            -1,
+            min(
+                100,
+                int(progress),
+            ),
+        )
+
+        state["status"] = status
+        state["updated_at"] = now()
+
+        if result is not None:
+            state["result"] = result
+
+        if error is not None:
+            state["error"] = error
+
+
+def public_task_state(
+    task_id: str,
+):
+
+    with _tasks_lock:
+
+        state = _tasks.get(task_id)
+
+        if state is None:
+            return None
+
+        result = {
+            "progress": int(
+                state.get(
+                    "progress",
+                    0,
+                )
+            ),
+            "status": str(
+                state.get(
+                    "status",
+                    "unknown",
+                )
+            ),
+            "cancelled": bool(
+                state.get(
+                    "cancelled",
+                    False,
+                )
+            ),
+        }
+
+        if state.get("result") is not None:
+            result["result"] = state["result"]
+
+        if state.get("error"):
+            result["error"] = state["error"]
+
+        return result
+
+
+def is_cancelled(
+    task_id: str,
+) -> bool:
+
+    with _tasks_lock:
+
+        state = _tasks.get(task_id)
+
+        if state is None:
+            return True
+
+        event = state.get(
+            "cancel_event"
+        )
+
+        return bool(
+            event
+            and event.is_set()
+        )
+
+
+def request_cancel(
+    task_id: str,
+) -> bool:
+
+    with _tasks_lock:
+
+        state = _tasks.get(task_id)
+
+        if state is None:
+            return False
+
+        state["cancelled"] = True
+        state["status"] = "Cancelling..."
+        state["updated_at"] = now()
+
+        event = state.get(
+            "cancel_event"
+        )
+
+        if event is not None:
+            event.set()
+
+        return True
+
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+
+def start_cleanup_thread():
+
+    global _cleanup_started
+
+    if _cleanup_started:
+        return
+
+    _cleanup_started = True
+
+    def cleanup_loop():
+
+        while True:
+
+            time.sleep(
+                CLEANUP_INTERVAL_SECONDS
+            )
+
+            cutoff = (
+                now()
+                - TASK_TTL_SECONDS
+            )
+
+            expired = []
+
+            with _tasks_lock:
+
+                for task_id, state in list(
+                    _tasks.items()
+                ):
+
+                    if (
+                        state.get(
+                            "updated_at",
+                            0,
+                        )
+                        < cutoff
+                    ):
+
+                        expired.append(
+                            task_id
+                        )
+
+                for task_id in expired:
+
+                    state = _tasks.pop(
+                        task_id,
+                        None,
+                    )
+
+                    if not state:
+                        continue
+
+                    output_path = (
+                        state.get(
+                            "output_path"
+                        )
+                    )
+
+                    if output_path:
+
+                        with suppress(
+                            OSError
+                        ):
+
+                            Path(
+                                output_path
+                            ).unlink()
+
+    thread = threading.Thread(
+        target=cleanup_loop,
+        daemon=True,
+        name="cricket-cleanup",
+    )
+
+    thread.start()
+
+
+@app.on_event("startup")
+async def startup():
+
+    start_cleanup_thread()
+
+    cutoff = (
+        now()
+        - TASK_TTL_SECONDS
+    )
+
+    for path in TMP_ROOT.iterdir():
+
+        try:
+
+            if (
+                path.is_dir()
+                and path.stat().st_mtime
+                < cutoff
+            ):
+
+                shutil.rmtree(
+                    path,
+                    ignore_errors=True,
+                )
+
+        except OSError:
+            pass
+
+
+# ============================================================================
+# FRAME PREPROCESSING
+# ============================================================================
 
 class ResizeWithPadding:
-    """
-    Preserve aspect ratio and pad to 224x224.
-    This matches the preprocessing used during training.
-    """
 
-    def __init__(self, image_size=224, fill=0):
+    def __init__(
+        self,
+        image_size: int = 224,
+        fill: int = 0,
+    ):
+
         self.image_size = image_size
         self.fill = fill
 
-    def __call__(self, img):
-        width, height = img.size
+    def __call__(
+        self,
+        image: Image.Image,
+    ):
+
+        width, height = image.size
+
+        if width <= 0 or height <= 0:
+            raise ValueError(
+                "Invalid image dimensions."
+            )
 
         scale = min(
             self.image_size / width,
@@ -103,13 +497,23 @@ class ResizeWithPadding:
             round(height * scale),
         )
 
-        img = img.resize(
-            (new_width, new_height),
+        image = image.resize(
+            (
+                new_width,
+                new_height,
+            ),
             Image.Resampling.BILINEAR,
         )
 
-        left = (self.image_size - new_width) // 2
-        top = (self.image_size - new_height) // 2
+        left = (
+            self.image_size
+            - new_width
+        ) // 2
+
+        top = (
+            self.image_size
+            - new_height
+        ) // 2
 
         right = (
             self.image_size
@@ -124,671 +528,1095 @@ class ResizeWithPadding:
         )
 
         return transforms.functional.pad(
-            img,
-            [left, top, right, bottom],
+            image,
+            [
+                left,
+                top,
+                right,
+                bottom,
+            ],
             fill=self.fill,
         )
 
 
-FRAME_TRANSFORM = transforms.Compose([
-    ResizeWithPadding(IMAGE_SIZE),
-
-    transforms.ToTensor(),
-
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    ),
-])
-
-
-# ============================================================
-# TASK MANAGEMENT
-# ============================================================
-
-active_tasks = {}
-
-
-def update_task(
-    task_id,
-    progress,
-    status,
-    **extra,
-):
-    """
-    Update task state while preserving cancellation state.
-    """
-
-    previous = active_tasks.get(
-        task_id,
-        {},
-    )
-
-    active_tasks[task_id] = {
-        "progress": progress,
-        "status": status,
-        "cancelled": previous.get(
-            "cancelled",
-            False,
+FRAME_TRANSFORM = transforms.Compose(
+    [
+        ResizeWithPadding(
+            IMAGE_SIZE
         ),
-        **extra,
-    }
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[
+                0.485,
+                0.456,
+                0.406,
+            ],
+            std=[
+                0.229,
+                0.224,
+                0.225,
+            ],
+        ),
+    ]
+)
 
 
-def is_cancelled(task_id):
-    return active_tasks.get(
-        task_id,
-        {},
-    ).get(
-        "cancelled",
-        False,
-    )
-
-
-# ============================================================
+# ============================================================================
 # MODEL LOADING
-# ============================================================
+# ============================================================================
 
-def load_cricket_model():
+def get_ball_detector():
 
-    if not CRICKET_MODEL.exists():
-        raise FileNotFoundError(
-            f"Cricket model not found: {CRICKET_MODEL}"
+    global _ball_detector
+
+    with _ball_detector_lock:
+
+        if _ball_detector is None:
+
+            if not BALL_MODEL.exists():
+
+                raise FileNotFoundError(
+                    f"Ball model not found:\n"
+                    f"{BALL_MODEL}"
+                )
+
+            _ball_detector = (
+                BallDetector()
+            )
+
+        return _ball_detector
+
+
+def get_shot_model():
+
+    global _shot_model
+
+    with _shot_model_lock:
+
+        if _shot_model is not None:
+            return _shot_model
+
+        if not SHOT_MODEL.exists():
+
+            raise FileNotFoundError(
+                f"Shot checkpoint not found:\n"
+                f"{SHOT_MODEL}"
+            )
+
+        print(
+            "[SHOT] Loading "
+            "EfficientNet-B0 + Transformer...",
+            flush=True,
         )
 
-    print(
-        "[*] Loading EfficientNet-B0 + BiGRU...",
-        flush=True,
-    )
+        model = ImprovedSOTAModel(
+            num_classes=len(
+                SHOT_CLASSES
+            ),
+            temporal_dim=256,
+            n_frames=N_FRAMES,
+        )
 
-    model = EfficientNetGRU(
-        num_classes=len(SHOT_CLASSES),
-        temporal_dim=256,
-        n_frames=N_FRAMES,
-    )
+        checkpoint = torch.load(
+            SHOT_MODEL,
+            map_location=DEVICE,
+            weights_only=False,
+        )
 
-    checkpoint = torch.load(
-        CRICKET_MODEL,
-        map_location=DEVICE,
-        weights_only=False,
-    )
+        if (
+            isinstance(
+                checkpoint,
+                dict,
+            )
+            and "state_dict"
+            in checkpoint
+        ):
 
-    if (
-        isinstance(checkpoint, dict)
-        and "state_dict" in checkpoint
-    ):
-        state_dict = checkpoint["state_dict"]
+            state_dict = dict(
+                checkpoint[
+                    "state_dict"
+                ]
+            )
 
-        # Lightning checkpoint contains this extra item.
+        else:
+
+            state_dict = checkpoint
+
+        if not isinstance(
+            state_dict,
+            dict,
+        ):
+
+            raise ValueError(
+                "Unsupported checkpoint format."
+            )
+
         state_dict.pop(
             "class_weights",
             None,
         )
 
-        cleaned_state_dict = {}
+        cleaned = {}
 
-        for key, value in state_dict.items():
+        for key, value in (
+            state_dict.items()
+        ):
 
-            if key.startswith("model."):
-                key = key[len("model."):]
+            if key.startswith(
+                "model."
+            ):
 
-            cleaned_state_dict[key] = value
+                key = key[
+                    len("model.") :
+                ]
 
-        state_dict = cleaned_state_dict
+            cleaned[key] = value
 
-    else:
-        state_dict = checkpoint
+        model.load_state_dict(
+            cleaned,
+            strict=True,
+        )
 
-    # The architecture/checkpoint were already verified.
-    model.load_state_dict(
-        state_dict,
-        strict=True,
-    )
+        model.to(DEVICE)
+        model.eval()
 
-    model.to(DEVICE)
-    model.eval()
+        _shot_model = model
 
-    print(
-        f"[+] Cricket model loaded on {DEVICE}",
-        flush=True,
-    )
+        print(
+            f"[SHOT] Transformer loaded "
+            f"on {DEVICE}",
+            flush=True,
+        )
 
-    return model
+        return model
 
 
-# ============================================================
-# FRAME LOADING
-# ============================================================
+# ============================================================================
+# SHOT CLASSIFICATION
+# ============================================================================
 
-def load_frames(frames_dir):
-    """
-    Load exactly 30 extracted frames.
+def sample_video_frames(
+    cap: cv2.VideoCapture,
+    start_frame: int,
+    end_frame: int,
+):
 
-    extract_frames.py creates:
-        frame_00.png
-        ...
-        frame_29.png
-    """
-
-    frames_dir = Path(frames_dir)
-
-    frame_paths = sorted(
-        frames_dir.glob("frame_*.png")
-    )
-
-    if len(frame_paths) != N_FRAMES:
+    if end_frame < start_frame:
         raise ValueError(
-            f"Expected {N_FRAMES} frames, "
-            f"found {len(frame_paths)} in {frames_dir}"
+            "Invalid frame range."
         )
 
-    frames = []
-
-    for frame_path in frame_paths:
-
-        image = Image.open(
-            frame_path
-        ).convert("RGB")
-
-        tensor = FRAME_TRANSFORM(
-            image
-        )
-
-        frames.append(tensor)
-
-    frames = torch.stack(
-        frames,
-        dim=0,
+    indices = np.linspace(
+        start_frame,
+        end_frame,
+        N_FRAMES,
+        dtype=np.int64,
     )
 
-    # (30, 3, 224, 224)
-    frames = frames.unsqueeze(0)
+    tensors = []
 
-    # (1, 30, 3, 224, 224)
-    return frames
+    for frame_index in indices:
 
+        cap.set(
+            cv2.CAP_PROP_POS_FRAMES,
+            int(frame_index),
+        )
 
-# ============================================================
-# MODEL PREDICTION
-# ============================================================
+        ok, frame = cap.read()
+
+        if not ok or frame is None:
+            continue
+
+        rgb = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2RGB,
+        )
+
+        image = Image.fromarray(
+            rgb
+        )
+
+        tensors.append(
+            FRAME_TRANSFORM(image)
+        )
+
+    if len(tensors) != N_FRAMES:
+
+        raise RuntimeError(
+            f"Expected {N_FRAMES} frames, "
+            f"read {len(tensors)}."
+        )
+
+    return torch.stack(
+        tensors,
+        dim=0,
+    ).unsqueeze(0)
+
 
 @torch.inference_mode()
-def predict_clip(
+def predict_frames(
     model,
     frames,
 ):
 
     frames = frames.to(
-        DEVICE
+        DEVICE,
+        non_blocking=(
+            DEVICE.type == "cuda"
+        ),
     )
 
-    logits = model(
-        frames
-    )
+    logits = model(frames)
 
     probabilities = F.softmax(
         logits,
         dim=1,
     )
 
-    confidence, class_index = torch.max(
-        probabilities,
-        dim=1,
+    confidence, index = (
+        torch.max(
+            probabilities,
+            dim=1,
+        )
     )
 
-    class_index = class_index.item()
-    confidence = confidence.item()
+    class_index = int(
+        index.item()
+    )
 
-    prediction = SHOT_CLASSES[
-        class_index
-    ]
+    result = {
 
-    class_probabilities = {}
+        "prediction":
+            SHOT_CLASSES[
+                class_index
+            ],
 
-    for i, class_name in enumerate(
-        SHOT_CLASSES
-    ):
-        class_probabilities[
-            class_name
-        ] = round(
-            probabilities[
-                0,
-                i,
-            ].item(),
-            6,
-        )
+        "confidence":
+            round(
+                float(
+                    confidence.item()
+                ),
+                6,
+            ),
 
-    return {
-        "prediction": prediction,
-        "confidence": round(
-            confidence,
-            6,
-        ),
-        "class_probabilities": (
-            class_probabilities
-        ),
+        "class_probabilities": {
+            name: round(
+                float(
+                    probabilities[
+                        0,
+                        i,
+                    ].item()
+                ),
+                6,
+            )
+            for i, name in enumerate(
+                SHOT_CLASSES
+            )
+        },
     }
 
+    return result
 
-# ============================================================
-# VIDEO VALIDATION
-# ============================================================
 
-def validate_video(video_path):
+# ============================================================================
+# CLIP RANGE
+# ============================================================================
 
-    cap = cv2.VideoCapture(
-        str(video_path)
+def make_clip_range(
+    first_frame: int,
+    last_frame: int,
+    total_frames: int,
+):
+
+    start = max(
+        0,
+        first_frame
+        - PRE_ROLL_FRAMES,
     )
 
-    if not cap.isOpened():
+    end = min(
+        total_frames - 1,
+        last_frame
+        + POST_ROLL_FRAMES,
+    )
+
+    length = (
+        end - start + 1
+    )
+
+    if length < MIN_CLIP_FRAMES:
+
+        missing = (
+            MIN_CLIP_FRAMES
+            - length
+        )
+
+        left = missing // 2
+        right = (
+            missing - left
+        )
+
+        start = max(
+            0,
+            start - left,
+        )
+
+        end = min(
+            total_frames - 1,
+            end + right,
+        )
+
+        length = (
+            end - start + 1
+        )
+
+        if (
+            length
+            < MIN_CLIP_FRAMES
+        ):
+
+            if start == 0:
+
+                end = min(
+                    total_frames - 1,
+                    MIN_CLIP_FRAMES - 1,
+                )
+
+            elif (
+                end
+                == total_frames - 1
+            ):
+
+                start = max(
+                    0,
+                    total_frames
+                    - MIN_CLIP_FRAMES,
+                )
+
+    if (
+        end - start + 1
+        > MAX_CLIP_FRAMES
+    ):
+
+        center = (
+            start + end
+        ) // 2
+
+        half = (
+            MAX_CLIP_FRAMES
+            // 2
+        )
+
+        start = max(
+            0,
+            center - half,
+        )
+
+        end = min(
+            total_frames - 1,
+            start
+            + MAX_CLIP_FRAMES
+            - 1,
+        )
+
+    return start, end
+
+
+# ============================================================================
+# DELIVERY FINALIZATION
+# ============================================================================
+
+def finalise_delivery(
+    positions,
+    H,
+    fps,
+    frame_height,
+    frame_width,
+    delivery_id,
+    deliveries,
+):
+
+    if (
+        len(positions)
+        < MIN_DELIVERY_FRAMES
+    ):
         return False
 
-    frame_count = int(
-        cap.get(
-            cv2.CAP_PROP_FRAME_COUNT
-        )
+    trajectory = [
+        point
+        for point, _ in positions
+    ]
+
+    bounce_idx = detect_bounce(
+        trajectory,
+        H,
     )
 
-    cap.release()
+    if bounce_idx is None:
 
-    return frame_count > 0
+        bounce_x, bounce_y = max(
+            trajectory,
+            key=lambda point: point[1],
+        )
+
+        bounce_idx = trajectory.index(
+            (
+                bounce_x,
+                bounce_y,
+            )
+        )
+
+    else:
+
+        bounce_x, bounce_y = (
+            trajectory[bounce_idx]
+        )
+
+    early = positions[
+        :MAX_EARLY_POSITIONS
+    ]
+
+    speed = compute_release_speed(
+        early,
+        fps,
+        H,
+    )
+
+    record = {
+
+        "ball":
+            int(delivery_id),
+
+        "frame_start":
+            int(positions[0][1]),
+
+        "frame_end":
+            int(positions[-1][1]),
+
+        "speed":
+            speed,
+
+        "length":
+            classify_length(
+                bounce_y,
+                frame_height,
+            ),
+
+        "line":
+            classify_line(
+                bounce_x,
+                frame_width,
+            ),
+
+        "swing":
+            estimate_swing(
+                trajectory,
+                bounce_idx,
+                H,
+            ),
+
+        "release_angle":
+            compute_release_angle(
+                positions
+            ),
+
+        "bounce_angle":
+            compute_bounce_angle(
+                trajectory,
+                bounce_idx,
+                H,
+            ),
+
+        "bounce_x":
+            round(
+                bounce_x
+                / frame_width,
+                3,
+            ),
+
+        "bounce_y":
+            round(
+                bounce_y
+                / frame_height,
+                3,
+            ),
+
+        "tracking_trajectory": [
+            {
+                "x": int(x),
+                "y": int(y),
+                "frame": int(frame),
+            }
+            for (x, y), frame
+            in positions
+        ],
+    }
+
+    deliveries.append(
+        record
+    )
+
+    return True
 
 
-# ============================================================
-# MAIN BACKGROUND PROCESS
-# ============================================================
+# ============================================================================
+# MAIN VIDEO PROCESSOR
+# ============================================================================
 
 def process_video(
     task_id,
     temp_dir,
     video_path,
-    clips_dir,
-    frames_dir,
+    output_path,
 ):
+
+    started = time.monotonic()
+
+    cap = None
+    writer = None
 
     try:
 
-        # ----------------------------------------------------
-        # INITIAL STATE
-        # ----------------------------------------------------
+        update_task(
+            task_id,
+            2,
+            "Opening video...",
+        )
+
+        cap = cv2.VideoCapture(
+            str(video_path)
+        )
+
+        if not cap.isOpened():
+
+            raise ValueError(
+                "Could not open video."
+            )
+
+        total_frames = int(
+            cap.get(
+                cv2.CAP_PROP_FRAME_COUNT
+            )
+        )
+
+        fps = get_fps(cap)
+
+        width = int(
+            cap.get(
+                cv2.CAP_PROP_FRAME_WIDTH
+            )
+        )
+
+        height = int(
+            cap.get(
+                cv2.CAP_PROP_FRAME_HEIGHT
+            )
+        )
+
+        if (
+            total_frames <= 0
+            or fps <= 0
+            or width <= 0
+            or height <= 0
+        ):
+
+            raise ValueError(
+                "Video metadata is invalid."
+            )
+
+        H = build_homography(
+            width,
+            height,
+        )
+
+        detector = (
+            get_ball_detector()
+        )
+
+        # ------------------------------------------------------------
+        # Output writer
+        # ------------------------------------------------------------
+
+        fourcc = (
+            cv2.VideoWriter_fourcc(
+                *"mp4v"
+            )
+        )
+
+        writer = cv2.VideoWriter(
+            str(output_path),
+            fourcc,
+            fps,
+            (
+                width,
+                height,
+            ),
+        )
+
+        if not writer.isOpened():
+
+            raise RuntimeError(
+                "Could not create "
+                "processed video."
+            )
+
+        tracker = BallTracker()
+
+        frame_number = 0
+
+        delivery_id = 1
+
+        last_delivery_frame = (
+            -MIN_FRAMES_BETWEEN_DELIVERIES
+        )
+
+        deliveries = []
+
+        trajectory_data = deque(
+            maxlen=MAX_TRAJECTORY_POINTS
+        )
 
         update_task(
             task_id,
             5,
-            "Validating uploaded video...",
+            "Tracking ball trajectory...",
         )
 
-        if is_cancelled(task_id):
-            return
+        # ============================================================
+        # TRACKING
+        # ============================================================
 
-        if not validate_video(
-            video_path
-        ):
-            raise ValueError(
-                "Could not open uploaded video."
-            )
+        while True:
 
-        # ----------------------------------------------------
-        # CHECK MODELS
-        # ----------------------------------------------------
-
-        if not BALL_MODEL.exists():
-            raise FileNotFoundError(
-                f"Ball model not found: {BALL_MODEL}"
-            )
-
-        if not BAT_MODEL.exists():
-            raise FileNotFoundError(
-                f"Bat model not found: {BAT_MODEL}"
-            )
-
-        if not CRICKET_MODEL.exists():
-            raise FileNotFoundError(
-                f"Cricket model not found: {CRICKET_MODEL}"
-            )
-
-        # ----------------------------------------------------
-        # AUTO CLIPPER
-        # ----------------------------------------------------
-
-        update_task(
-            task_id,
-            10,
-            "Loading ball and bat detection models...",
-        )
-
-        if is_cancelled(task_id):
-            return
-
-        clipper = AutoClipper(
-            ball_model_path=str(
-                BALL_MODEL
-            ),
-            bat_model_path=str(
-                BAT_MODEL
-            ),
-            output_dir=str(
-                clips_dir
-            ),
-            confidence=0.30,
-            use_ocr=True,
-            ocr_gpu=False,
-        )
-
-        update_task(
-            task_id,
-            15,
-            "Extracting delivery clips...",
-        )
-
-        if is_cancelled(task_id):
-            return
-
-        extracted_clips = (
-            clipper.process_match(
-                str(video_path),
-                clip_duration_sec=1.0,
-                active_tasks=active_tasks,
-                task_id=task_id,
-                temp_dir=temp_dir,
-            )
-        )
-
-        if is_cancelled(task_id):
-            print(
-                f"[INFO] Task {task_id} cancelled "
-                f"after delivery extraction.",
-                flush=True,
-            )
-            return
-
-        # ----------------------------------------------------
-        # NO DELIVERY
-        # ----------------------------------------------------
-
-        if not extracted_clips:
-
-            update_task(
-                task_id,
-                100,
-                "Complete",
-                result={
-                    "prediction": None,
-                    "confidence": 0,
-                    "class_probabilities": {},
-                    "timeline": [],
-                    "clips_processed": 0,
-                    "message": (
-                        "No valid delivery was detected "
-                        "in the uploaded video."
-                    ),
-                },
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # LOAD CRICKET MODEL
-        # ----------------------------------------------------
-
-        update_task(
-            task_id,
-            50,
-            "Loading EfficientNet-B0 + BiGRU...",
-        )
-
-        if is_cancelled(task_id):
-            return
-
-        model = load_cricket_model()
-
-        predictions = []
-
-        total_clips = len(
-            extracted_clips
-        )
-
-        # ----------------------------------------------------
-        # CLASSIFY EACH DELIVERY
-        # ----------------------------------------------------
-
-        for clip_number, clip_path in enumerate(
-            extracted_clips,
-            start=1,
-        ):
-
-            if is_cancelled(task_id):
-
-                print(
-                    f"[INFO] Task {task_id} "
-                    f"cancelled during inference.",
-                    flush=True,
-                )
-
+            if is_cancelled(
+                task_id
+            ):
                 return
 
-            clip_path = Path(
-                clip_path
+            ok, frame = cap.read()
+
+            if not ok:
+                break
+
+            frame_number += 1
+
+            detection = (
+                detector.detect(frame)
             )
 
-            delivery_id = (
-                clip_path.stem
+            position = tracker.update(
+                detection,
+                frame_number,
             )
 
-            current_frames_dir = (
-                frames_dir / delivery_id
-            )
+            if position is not None:
 
-            current_frames_dir.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+                trajectory_data.append(
+                    {
+                        "frame":
+                            frame_number,
+                        "x":
+                            int(
+                                position[0]
+                            ),
+                        "y":
+                            int(
+                                position[1]
+                            ),
+                    }
+                )
 
-            # -----------------------------------------------
-            # Progress
-            # -----------------------------------------------
+            # --------------------------------------------------------
+            # Delivery finished
+            # --------------------------------------------------------
 
-            progress = (
-                50
-                + int(
-                    (
-                        clip_number
-                        / total_clips
+            if (
+                tracker.is_lost
+                and tracker.in_delivery
+            ):
+
+                positions = list(
+                    tracker.delivery_positions
+                )
+
+                if (
+                    frame_number
+                    - last_delivery_frame
+                    >= MIN_FRAMES_BETWEEN_DELIVERIES
+                ):
+
+                    added = (
+                        finalise_delivery(
+                            positions,
+                            H,
+                            fps,
+                            height,
+                            width,
+                            delivery_id,
+                            deliveries,
+                        )
                     )
-                    * 35
+
+                    if added:
+
+                        last_delivery_frame = (
+                            frame_number
+                        )
+
+                        delivery_id += 1
+
+                tracker.reset_delivery()
+
+            # --------------------------------------------------------
+            # Draw tracking trail
+            # --------------------------------------------------------
+
+            trail = tracker.traj_points
+
+            if len(trail) >= 2:
+
+                draw_trajectory_trail(
+                    frame,
+                    trail,
                 )
+
+            writer.write(frame)
+
+            if (
+                frame_number % 10
+                == 0
+            ):
+
+                progress = int(
+                    5
+                    + (
+                        frame_number
+                        / total_frames
+                    )
+                    * 50
+                )
+
+                update_task(
+                    task_id,
+                    progress,
+                    (
+                        "Tracking video "
+                        f"{frame_number}/"
+                        f"{total_frames}"
+                    ),
+                )
+
+        # ============================================================
+        # FINAL DELIVERY
+        # ============================================================
+
+        if (
+            not is_cancelled(task_id)
+            and tracker.in_delivery
+        ):
+
+            positions = list(
+                tracker.delivery_positions
             )
+
+            if len(positions) >= (
+                MIN_DELIVERY_FRAMES
+            ):
+
+                if (
+                    frame_number
+                    - last_delivery_frame
+                    >= MIN_FRAMES_BETWEEN_DELIVERIES
+                ):
+
+                    added = (
+                        finalise_delivery(
+                            positions,
+                            H,
+                            fps,
+                            height,
+                            width,
+                            delivery_id,
+                            deliveries,
+                        )
+                    )
+
+                    if added:
+                        delivery_id += 1
+
+        cap.release()
+        cap = None
+
+        writer.release()
+        writer = None
+
+        if is_cancelled(
+            task_id
+        ):
+
+            with suppress(
+                OSError
+            ):
+                output_path.unlink()
 
             update_task(
                 task_id,
-                progress,
-                (
-                    "Extracting 30 uniform frames "
-                    f"(Clip {clip_number}/{total_clips})..."
-                ),
+                0,
+                "Cancelled",
             )
 
-            if is_cancelled(task_id):
-                return
-
-            # -----------------------------------------------
-            # Extract frames
-            # -----------------------------------------------
-
-            success = extract_frames(
-                clip_path,
-                current_frames_dir,
-            )
-
-            if not success:
-
-                print(
-                    f"[WARNING] Frame extraction failed: "
-                    f"{clip_path}",
-                    flush=True,
-                )
-
-                continue
-
-            if is_cancelled(task_id):
-                return
-
-            # -----------------------------------------------
-            # Load + preprocess frames
-            # -----------------------------------------------
-
-            frames = load_frames(
-                current_frames_dir
-            )
-
-            if is_cancelled(task_id):
-                return
-
-            # -----------------------------------------------
-            # Model inference
-            # -----------------------------------------------
-
-            update_task(
-                task_id,
-                progress,
-                (
-                    "BiGRU temporal analysis "
-                    f"(Clip {clip_number}/{total_clips})..."
-                ),
-            )
-
-            result = predict_clip(
-                model,
-                frames,
-            )
-
-            result["delivery_id"] = (
-                delivery_id
-            )
-
-            result["clip_number"] = (
-                clip_number
-            )
-
-            predictions.append(
-                result
-            )
-
-        # ----------------------------------------------------
-        # CANCELLED
-        # ----------------------------------------------------
-
-        if is_cancelled(task_id):
             return
 
-        # ----------------------------------------------------
-        # NO CLASSIFIABLE CLIPS
-        # ----------------------------------------------------
+        if not deliveries:
 
-        if not predictions:
             raise ValueError(
-                "Delivery clips were detected, "
-                "but no clip could be classified."
+                "No valid ball deliveries "
+                "were detected."
             )
 
-        # ----------------------------------------------------
-        # AVERAGE CLASS PROBABILITIES
-        # ----------------------------------------------------
+        # ============================================================
+        # SHOT CLASSIFICATION
+        # ============================================================
+
+        model = get_shot_model()
 
         update_task(
             task_id,
-            90,
-            "Finalizing classification...",
+            55,
+            (
+                f"Classifying "
+                f"{len(deliveries)} deliveries..."
+            ),
         )
 
-        averaged_probabilities = {}
+        classify_cap = cv2.VideoCapture(
+            str(video_path)
+        )
 
-        for class_name in SHOT_CLASSES:
+        if not classify_cap.isOpened():
 
-            values = [
-                prediction[
-                    "class_probabilities"
-                ][class_name]
-                for prediction in predictions
-            ]
-
-            averaged_probabilities[
-                class_name
-            ] = round(
-                float(
-                    np.mean(values)
-                ),
-                6,
+            raise RuntimeError(
+                "Could not reopen video "
+                "for classification."
             )
 
-        # ----------------------------------------------------
-        # FINAL CLASS
-        # ----------------------------------------------------
+        try:
 
-        final_class_index = int(
-            np.argmax(
-                [
-                    averaged_probabilities[
-                        class_name
-                    ]
-                    for class_name in SHOT_CLASSES
-                ]
+            total_deliveries = (
+                len(deliveries)
             )
-        )
 
-        final_prediction = (
-            SHOT_CLASSES[
-                final_class_index
-            ]
-        )
+            for index, delivery in enumerate(
+                deliveries,
+                start=1,
+            ):
 
-        final_confidence = (
-            averaged_probabilities[
-                final_prediction
-            ]
-        )
+                if is_cancelled(
+                    task_id
+                ):
+                    return
 
-        # ----------------------------------------------------
-        # TIMELINE
-        # ----------------------------------------------------
+                clip_start, clip_end = (
+                    make_clip_range(
+                        delivery[
+                            "frame_start"
+                        ],
+                        delivery[
+                            "frame_end"
+                        ],
+                        total_frames,
+                    )
+                )
+
+                frames = (
+                    sample_video_frames(
+                        classify_cap,
+                        clip_start,
+                        clip_end,
+                    )
+                )
+
+                shot = predict_frames(
+                    model,
+                    frames,
+                )
+
+                delivery[
+                    "clip_start"
+                ] = clip_start
+
+                delivery[
+                    "clip_end"
+                ] = clip_end
+
+                delivery[
+                    "shot"
+                ] = shot
+
+                progress = (
+                    55
+                    + int(
+                        (
+                            index
+                            / total_deliveries
+                        )
+                        * 40
+                    )
+                )
+
+                update_task(
+                    task_id,
+                    progress,
+                    (
+                        f"Classifying delivery "
+                        f"{index}/"
+                        f"{total_deliveries}"
+                    ),
+                )
+
+        finally:
+
+            classify_cap.release()
+
+        if is_cancelled(
+            task_id
+        ):
+
+            with suppress(
+                OSError
+            ):
+                output_path.unlink()
+
+            update_task(
+                task_id,
+                0,
+                "Cancelled",
+            )
+
+            return
+
+        # ============================================================
+        # RESULT
+        # ============================================================
+
+        shot_distribution = {
+            name: 0
+            for name in SHOT_CLASSES
+        }
+
+        confidence_values = []
 
         timeline = []
 
-        for prediction in predictions:
+        for delivery in deliveries:
 
-            timeline.append({
-                "frame": prediction[
-                    "clip_number"
-                ],
-                "confidence": round(
-                    prediction[
-                        "confidence"
-                    ] * 100,
-                    2,
-                ),
-                "prediction": prediction[
-                    "prediction"
-                ],
-            })
+            shot = delivery[
+                "shot"
+            ]
 
-        # ----------------------------------------------------
-        # FINAL RESULT
-        # ----------------------------------------------------
+            prediction = shot[
+                "prediction"
+            ]
+
+            shot_distribution[
+                prediction
+            ] += 1
+
+            confidence = float(
+                shot[
+                    "confidence"
+                ]
+            )
+
+            confidence_values.append(
+                confidence
+            )
+
+            timeline.append(
+                {
+                    "frame":
+                        delivery[
+                            "ball"
+                        ],
+
+                    "confidence":
+                        round(
+                            confidence
+                            * 100,
+                            2,
+                        ),
+
+                    "prediction":
+                        prediction,
+                }
+            )
 
         result = {
-            "prediction": final_prediction,
-            "confidence": round(
-                final_confidence,
-                6,
-            ),
-            "class_probabilities": (
-                averaged_probabilities
-            ),
-            "timeline": timeline,
-            "clips_processed": len(
-                predictions
-            ),
+
+            "prediction":
+                None,
+
+            "confidence":
+                0,
+
+            "class_probabilities":
+                {},
+
+            "timeline":
+                timeline,
+
+            "clips_processed":
+                len(deliveries),
+
+            "deliveries":
+                deliveries,
+
+            "shot_distribution":
+                shot_distribution,
+
+            "average_shot_confidence":
+                round(
+                    statistics.fmean(
+                        confidence_values
+                    ),
+                    6,
+                )
+                if confidence_values
+                else 0,
+
+            "trajectory":
+                list(
+                    trajectory_data
+                ),
+
+            "video_url":
+                f"/outputs/"
+                f"{output_path.name}",
+
+            "processing_time":
+                round(
+                    time.monotonic()
+                    - started,
+                    2,
+                ),
+
+            "device":
+                str(DEVICE),
         }
+
+        with _tasks_lock:
+
+            state = _tasks.get(
+                task_id
+            )
+
+            if state:
+
+                state[
+                    "output_path"
+                ] = str(
+                    output_path
+                )
 
         update_task(
             task_id,
@@ -798,301 +1626,579 @@ def process_video(
         )
 
         print(
-            f"[+] Task {task_id} complete: "
-            f"{final_prediction} "
-            f"({final_confidence * 100:.2f}%)",
+            f"[DONE] {task_id}: "
+            f"{len(deliveries)} deliveries",
             flush=True,
         )
 
-    except Exception as e:
+    except Exception as exc:
 
         import traceback
 
         traceback.print_exc()
 
-        print(
-            f"[ERROR] Task {task_id}: "
-            f"{type(e).__name__}: {e}",
-            flush=True,
+        with suppress(
+            OSError
+        ):
+            if output_path.exists():
+                output_path.unlink()
+
+        if is_cancelled(
+            task_id
+        ):
+
+            update_task(
+                task_id,
+                0,
+                "Cancelled",
+            )
+
+        else:
+
+            update_task(
+                task_id,
+                -1,
+                "Error",
+                error=str(exc),
+            )
+
+    finally:
+
+        if cap is not None:
+            with suppress(Exception):
+                cap.release()
+
+        if writer is not None:
+            with suppress(Exception):
+                writer.release()
+
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
         )
 
-        update_task(
+        if DEVICE.type == "cuda":
+
+            with suppress(Exception):
+                torch.cuda.empty_cache()
+
+
+# ============================================================================
+# WORKER
+# ============================================================================
+
+def run_task(
+    task_id,
+    temp_dir,
+    video_path,
+    output_path,
+):
+
+    acquired = False
+
+    try:
+
+        while not acquired:
+
+            if is_cancelled(
+                task_id
+            ):
+
+                update_task(
+                    task_id,
+                    0,
+                    "Cancelled",
+                )
+
+                return
+
+            acquired = (
+                PROCESS_LOCK.acquire(
+                    timeout=0.25
+                )
+            )
+
+        process_video(
             task_id,
-            -1,
-            "Error",
-            error=str(e),
+            temp_dir,
+            video_path,
+            output_path,
         )
 
     finally:
 
-        if (
-            temp_dir is not None
-            and temp_dir.exists()
-        ):
-            shutil.rmtree(
-                temp_dir,
-                ignore_errors=True,
-            )
+        if acquired:
+            PROCESS_LOCK.release()
 
 
-# ============================================================
-# PREDICT
-# ============================================================
+# ============================================================================
+# UPLOAD
+# ============================================================================
 
-@app.post("/api/predict")
-async def predict_shot(
-    background_tasks: BackgroundTasks,
-    video: UploadFile = File(...),
+async def create_processing_task(
+    file: UploadFile,
 ):
 
-    task_id = str(
-        uuid.uuid4()
-    )
+    if not file.filename:
 
-    active_tasks[task_id] = {
-        "progress": 0,
-        "status": "Uploading video...",
-        "cancelled": False,
+        raise HTTPException(
+            status_code=400,
+            detail="No file provided.",
+        )
+
+    allowed_extensions = {
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".webm",
+        ".m4v",
     }
 
-    temp_dir = None
+    extension = (
+        Path(
+            file.filename
+        ).suffix.lower()
+    )
+
+    if (
+        extension
+        not in allowed_extensions
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported video format."
+            ),
+        )
+
+    task_id = create_task()
+
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix=(
+                f"cricket_{task_id}_"
+            ),
+            dir=str(TMP_ROOT),
+        )
+    )
+
+    video_path = (
+        temp_dir
+        / f"input{extension}"
+    )
+
+    output_path = (
+        OUTPUT_DIR
+        / f"{task_id}.mp4"
+    )
 
     try:
 
-        # ----------------------------------------------------
-        # Temporary directory
-        # ----------------------------------------------------
+        total_bytes = 0
 
-        temp_dir = Path(
-            tempfile.mkdtemp(
-                prefix="cricket_"
-            )
-        )
-
-        video_path = (
-            temp_dir / "input_video.mp4"
-        )
-
-        clips_dir = (
-            temp_dir / "delivery_clips"
-        )
-
-        frames_dir = (
-            temp_dir / "frames"
-        )
-
-        clips_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        frames_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        # ----------------------------------------------------
-        # Save upload
-        # ----------------------------------------------------
-
-        await video.seek(0)
-
-        with open(
-            video_path,
-            "wb",
+        with video_path.open(
+            "wb"
         ) as buffer:
 
             while True:
 
-                chunk = await video.read(
+                chunk = await file.read(
                     1024 * 1024
                 )
 
                 if not chunk:
                     break
 
+                total_bytes += len(
+                    chunk
+                )
+
+                if (
+                    total_bytes
+                    > MAX_UPLOAD_BYTES
+                ):
+
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "Video exceeds "
+                            "500 MB limit."
+                        ),
+                    )
+
                 buffer.write(chunk)
 
-        # ----------------------------------------------------
-        # Schedule background processing
-        # ----------------------------------------------------
+        await file.close()
 
-        background_tasks.add_task(
-            process_video,
-            task_id,
-            temp_dir,
-            video_path,
-            clips_dir,
-            frames_dir,
-        )
+        if total_bytes == 0:
 
-        return {
-            "task_id": task_id
-        }
-
-    except Exception as e:
-
-        if (
-            temp_dir is not None
-            and temp_dir.exists()
-        ):
-            shutil.rmtree(
-                temp_dir,
-                ignore_errors=True,
+            raise HTTPException(
+                status_code=400,
+                detail="Video is empty.",
             )
 
-        update_task(
-            task_id,
-            -1,
-            "Error",
-            error=str(e),
+        with _tasks_lock:
+
+            _tasks[task_id][
+                "temp_dir"
+            ] = str(temp_dir)
+
+            _tasks[task_id][
+                "output_path"
+            ] = str(output_path)
+
+        thread = threading.Thread(
+            target=run_task,
+            args=(
+                task_id,
+                temp_dir,
+                video_path,
+                output_path,
+            ),
+            daemon=True,
+            name=(
+                f"cricket-{task_id[:8]}"
+            ),
         )
 
-        return JSONResponse(
-            status_code=500,
-            content={
-                "detail": str(e)
-            },
+        thread.start()
+
+        return task_id
+
+    except Exception:
+
+        await file.close()
+
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
         )
 
+        with _tasks_lock:
+            _tasks.pop(
+                task_id,
+                None,
+            )
 
-# ============================================================
-# CANCEL
-# ============================================================
+        raise
 
-@app.delete("/api/cancel/{task_id}")
-async def cancel_task(
+
+# ============================================================================
+# API
+# ============================================================================
+
+@app.post("/api/predict")
+async def predict(
+    video: UploadFile = File(...),
+):
+
+    task_id = (
+        await create_processing_task(
+            video
+        )
+    )
+
+    return {
+        "task_id": task_id
+    }
+
+
+@app.delete(
+    "/api/cancel/{task_id}"
+)
+async def cancel(
     task_id: str,
 ):
 
-    print(
-        f"[CANCEL] Received cancellation "
-        f"request for {task_id}",
-        flush=True,
-    )
-
-    if task_id not in active_tasks:
+    if not request_cancel(
+        task_id
+    ):
 
         return JSONResponse(
             status_code=404,
             content={
-                "detail": "Task not found."
+                "detail":
+                    "Task not found."
             },
         )
 
-    active_tasks[
-        task_id
-    ]["cancelled"] = True
-
-    active_tasks[
-        task_id
-    ]["status"] = "Cancelling..."
-
-    print(
-        f"[CANCEL] Task {task_id} marked "
-        f"for cancellation.",
-        flush=True,
-    )
-
     return {
         "status": "success",
-        "message": (
-            f"Task {task_id} marked for cancellation."
-        ),
+        "message":
+            "Cancellation requested.",
     }
 
 
-# ============================================================
-# PROGRESS / SSE
-# ============================================================
-
-@app.get("/api/progress/{task_id}")
-async def get_progress(
+@app.get(
+    "/api/progress/{task_id}"
+)
+async def progress(
     task_id: str,
+    request: Request,
 ):
 
-    async def event_generator():
+    if (
+        public_task_state(
+            task_id
+        )
+        is None
+    ):
+
+        return StreamingResponse(
+            iter(
+                [
+                    "data: "
+                    + json.dumps(
+                        {
+                            "progress":
+                                -1,
+                            "status":
+                                "Task not found",
+                            "cancelled":
+                                False,
+                        }
+                    )
+                    + "\n\n"
+                ]
+            ),
+            media_type=(
+                "text/event-stream"
+            ),
+        )
+
+    async def generator():
 
         while True:
 
-            if task_id not in active_tasks:
+            state = (
+                public_task_state(
+                    task_id
+                )
+            )
+
+            if state is None:
 
                 yield (
                     "data: "
-                    + json.dumps({
-                        "progress": -1,
-                        "status": "Task not found",
-                    })
+                    + json.dumps(
+                        {
+                            "progress":
+                                -1,
+                            "status":
+                                "Task expired",
+                            "cancelled":
+                                False,
+                        }
+                    )
                     + "\n\n"
                 )
 
-                break
-
-            state = active_tasks[
-                task_id
-            ]
+                return
 
             yield (
                 "data: "
-                + json.dumps(state)
+                + json.dumps(
+                    state
+                )
                 + "\n\n"
             )
 
-            progress = state.get(
-                "progress",
-                0,
-            )
-
             if (
-                progress == 100
-                or progress < 0
-                or state.get("cancelled")
+                state["progress"]
+                == 100
+                or state["progress"]
+                < 0
+                or state["cancelled"]
+                or state["status"]
+                in {
+                    "Cancelled",
+                    "Error",
+                }
             ):
-                break
+
+                return
+
+            if await request.is_disconnected():
+                return
 
             await asyncio.sleep(
-                0.2
+                0.25
             )
 
     return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
+        generator(),
+        media_type=(
+            "text/event-stream"
+        ),
         headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
+            "Cache-Control":
+                "no-cache",
+            "Connection":
+                "keep-alive",
+            "X-Accel-Buffering":
+                "no",
         },
     )
 
 
-# ============================================================
+# ============================================================================
 # HEALTH
-# ============================================================
+# ============================================================================
 
 @app.get("/api/health")
-async def health_check():
+async def health():
 
     return {
-        "status": "CricShot Pipeline Online",
-        "device": str(DEVICE),
+
+        "status":
+            "CricShot + CricketTracker Online",
+
+        "device":
+            str(DEVICE),
+
+        "ball_model_exists":
+            BALL_MODEL.exists(),
+
+        "shot_model_exists":
+            SHOT_MODEL.exists(),
+
+        "ball_model_loaded":
+            _ball_detector is not None,
+
+        "shot_model_loaded":
+            _shot_model is not None,
     }
 
 
-# ============================================================
+# ============================================================================
+# LEGACY BALL TRACKING API
+# ============================================================================
+
+@app.post("/upload")
+async def legacy_upload(
+    file: UploadFile = File(...),
+):
+
+    task_id = (
+        await create_processing_task(
+            file
+        )
+    )
+
+    return {
+        "message":
+            "Processing started",
+        "task_id":
+            task_id,
+    }
+
+
+@app.get("/status")
+async def legacy_status():
+
+    with _tasks_lock:
+
+        if not _tasks:
+
+            return {
+                "status":
+                    "idle",
+                "progress":
+                    0,
+                "result":
+                    None,
+                "processing_time":
+                    0,
+                "error_message":
+                    None,
+            }
+
+        task_id = max(
+            _tasks,
+            key=lambda key:
+                _tasks[key].get(
+                    "created_at",
+                    0,
+                ),
+        )
+
+        state = _tasks[
+            task_id
+        ]
+
+        result = state.get(
+            "result"
+        )
+
+        wrapped = None
+
+        if result is not None:
+
+            wrapped = {
+                "video_url":
+                    result.get(
+                        "video_url"
+                    ),
+                "json_data":
+                    result,
+            }
+
+        return {
+
+            "task_id":
+                task_id,
+
+            "status":
+                str(
+                    state.get(
+                        "status",
+                        "idle",
+                    )
+                ).lower(),
+
+            "progress":
+                state.get(
+                    "progress",
+                    0,
+                ),
+
+            "result":
+                wrapped,
+
+            "processing_time":
+                (
+                    result.get(
+                        "processing_time",
+                        0,
+                    )
+                    if result
+                    else 0
+                ),
+
+            "error_message":
+                state.get(
+                    "error"
+                ),
+        }
+
+
+# ============================================================================
 # VISUALIZATION
-# ============================================================
+# ============================================================================
 
 @app.get("/api/visualization")
-async def get_visualization():
+async def visualization():
 
     return {
-        "status": "Visualization data available"
+        "status":
+            "Visualization data available"
     }
 
 
-# ============================================================
-# LOCAL DEVELOPMENT
-# ============================================================
+# ============================================================================
+# RUN
+# ============================================================================
 
 if __name__ == "__main__":
 
@@ -1101,6 +2207,11 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=int(
+            os.getenv(
+                "PORT",
+                "8000",
+            )
+        ),
         reload=False,
     )
